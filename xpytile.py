@@ -570,11 +570,21 @@ def init_tiling_info(config):
 
     # configured settings that define ...
     #   ... what windows should be ignored depending on their name and title.
-    tilingInfo['ignoreWindows'] = list()
-    for line in config['General']['ignoreWindows'].split('\n'):
+
+    tilingInfo['allowWindows'] = list()
+    for line in config['General'].get('allowWindows', '').split('\n'):
         entry = parseConfigIgnoreWindowEntry(line)
         if entry is not None:
-            tilingInfo['ignoreWindows'].append(entry)
+            tilingInfo['allowWindows'].append(entry)
+
+
+    tilingInfo['ignoreWindows'] = list()
+
+    if len(tilingInfo['allowWindows']) == 0:
+	    for line in config['General'].get('ignoreWindows', '').split('\n'):
+	        entry = parseConfigIgnoreWindowEntry(line)
+	        if entry is not None:
+	            tilingInfo['ignoreWindows'].append(entry)
 
     #   ... what windows should be ignored regarding (un)decoratating depending on their name and title.
     tilingInfo['ignoreWindowsForDecoration'] = list()
@@ -751,6 +761,37 @@ def match(compRexExList, string):
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
+def match_window_to_config(config_entries, name, title, log_prefix=None):
+    """
+    Checks whether the window matches any of the config entries, depending on its name and title
+
+    :param config_entries:     list of dict, what combinations of name/title should be checked
+    :param name:               name of the window/application
+    :param title:              title of the window
+    :param log_prefix:         if set, log matching info with this prefix
+    :return:                   status whether it matched [True | False]
+    """
+
+    for e in config_entries:
+        if e['name'].match(name):
+            if e['title'] is None:
+                if verbosityLevel > 1 and log_prefix:
+                    print(f'{log_prefix} window:\t'
+                          f'name "{name}" matches pattern "{e["name"].pattern}"\t'
+                          f'title is irrelevant')
+                return True
+            if bool(e['title'].match(title)) == e['!title']:
+                if verbosityLevel > 1 and log_prefix:
+                    print(f'{log_prefix} window:\t'
+                          f'name "{name}" matches pattern "{e["name"].pattern}"\t'
+                          f'{"!" * (not e["!title"])}title "{title}" {("does not match", "matches")[e["!title"]]}'
+                          f'pattern "{e["title"].pattern}"')
+                return True
+
+    return False
+# ----------------------------------------------------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------------------------------------------------
 def match_ignore(ignoreWindows, name, title):
     """
     Checks whether to ignore the window, depending on its name and title
@@ -761,23 +802,7 @@ def match_ignore(ignoreWindows, name, title):
     :return:                   status whether to ignore the window [True | False]
     """
 
-    for e in ignoreWindows:
-        if e['name'].match(name):
-            if e['title'] is None:
-                if verbosityLevel > 1:
-                    print('Ignoring window:\t'
-                          f'name "{name}" matches pattern "{e["name"].pattern}"\t'
-                          f'title is irrelevant')
-                return True
-            if bool(e['title'].match(title)) == e['!title']:
-                if verbosityLevel > 1:
-                    print('Ignoring window:\t'
-                          f'name "{name}" matches pattern "{e["name"].pattern}"\t'
-                          f'{"!" * (not e["!title"])}title "{title}" {("does not match", "matches")[e["!title"]]}'
-                          f'pattern "{e["title"].pattern}"')
-                return True
-
-    return False
+    return match_window_to_config(ignoreWindows, name, title, 'Ignoring')
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1779,9 +1804,15 @@ def update_windows_info(windowID_active=None):
                           f'name: "{name}"\ttitle: "{title}"')
                 continue  # ignore sticky window (visible on all workspaces)
 
-            if winID in windowsInfo or not match_ignore(tilingInfo['ignoreWindows'],
-                                                        (name := win.get_wm_class()[1]),
-                                                        get_windows_title(win)):
+            name = win.get_wm_class()[1]
+            title = get_windows_title(win)
+
+            if tilingInfo['allowWindows']:
+                is_ignored = not match_window_to_config(tilingInfo['allowWindows'], name, title, 'Allowing')
+            else:
+                is_ignored = match_ignore(tilingInfo['ignoreWindows'], name, title)
+
+            if winID in windowsInfo or not is_ignored:
                 desktop = win.get_full_property(NET_WM_DESKTOP, ANY_PROPERTYTYPE).value[0]
                 geometry = get_window_geometry(win)
                 if geometry is None:  # window vanished
