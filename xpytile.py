@@ -130,18 +130,19 @@ def get_moved_border(winID, window):
 
     :param winID:    ID of the window
     :param window:   window
-    :return:         a number that indicates which window edges got shifted
+    :return:         a tuple (moved_border, geometry)
     """
     global windowsInfo
 
     moved_border = 0
+    geometry = get_window_geometry(window, winID)
+    if geometry is None:
+        return 0, None
+
     try:
         winInfo = windowsInfo[winID]
-        geometry = get_window_geometry(window)
-        if geometry is None:  # window vanished
-            return moved_border
     except KeyError:
-        return moved_border
+        return 0, geometry
 
     if winInfo['x'] != geometry.x:
         moved_border += 1  # left border
@@ -152,7 +153,7 @@ def get_moved_border(winID, window):
     if winInfo['y2'] != geometry.y + geometry.height - 1:
         moved_border += 8  # lower border
 
-    return moved_border
+    return moved_border, geometry
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -168,9 +169,11 @@ def get_parent_window(window):
     :param window:    window
     :return:          parent window
     """
+    global Xroot
 
     try:
         pointer = window
+        parentWindow = pointer
         while pointer.id != Xroot.id:
             parentWindow = pointer
             pointer = pointer.query_tree().parent
@@ -181,16 +184,20 @@ def get_parent_window(window):
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
-def get_window_geometry(win):
+def get_window_geometry(win, winID=None):
     """
     Return the geometry of the top most parent window.
     See the comment in get_active_window_and_ancestors()
 
     :param win:    window
+    :param winID:  optional window-ID to use cached parent
     :return:       geometry of the top most parent window
     """
+    global windowsInfo
 
     try:
+        if winID is not None and winID in windowsInfo and windowsInfo[winID]['winParent'] is not None:
+            return windowsInfo[winID]['winParent'].get_geometry()
         return get_parent_window(win).get_geometry()
     except:
         return None   # window vanished
@@ -872,101 +879,125 @@ def recreate_window_geometries():
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
-def resize_docked_windows(windowID_active, window_active, moved_border):
+def resize_docked_windows(windowID_active, window_active, moved_border, active_geometry):
     """
-    Resize the side-by-side docked windwows.
-    The function deliberately retrieves the current window geometry of the active window
-    rather than using the already existing information of the event structure.
-    This saves a good amount of redrawing.
+    Resize the side-by-side docked windwows using a spatial topology solver, mimicking true TWMs.
 
     :param windowID_active:   ID of the active window
     :param window_active:     active window
     :param moved_border:      points out which border of the active window got moved
+    :param active_geometry:   geometry snapshot of the active window
     :return:
     """
     global disp, tilingInfo, NET_WORKAREA
-    global windowsInfo  # dict with windows and their geometries (before last resize of the active window)
+    global windowsInfo  # dict with windows and their geometries
 
-    tolerance = 3
-
-    if moved_border not in [1, 2, 4, 8]:  # 1: left, 2: upper, 4: right, 8: lower
+    if not moved_border or active_geometry is None:
         return None
 
-    winInfo_active = windowsInfo[windowID_active]
+    winInfo_active = windowsInfo.get(windowID_active)
+    if not winInfo_active:
+        return None
 
     # check whether resizing is active for the desktop of the resized window
     desktop = winInfo_active['desktop']
     if not tilingInfo['resizeWindows'][desktop]:
         return
 
-    # geometry of work area (screen without taskbar)
-    workAreaWidth, workAreaHeight = Xroot.get_full_property(NET_WORKAREA, 0).value.tolist()[2:4]
+    # Check for pure translation (moved all borders without changing size)
+    if active_geometry.width == winInfo_active['width'] and active_geometry.height == winInfo_active['height']:
+        return
 
-    for winID, winInfo in windowsInfo.items():
-        if winID == windowID_active or winInfo['desktop'] != desktop:
+    for border in [1, 2, 4, 8]:
+        if not (moved_border & border):
             continue
 
-        if moved_border == 1:  # left border
-            # check, whether the windows were docked,
-            # before the geometry of the active window changed
-            if abs(winInfo['x2'] + 1 - winInfo_active['x']) <= tilingInfo['margin'] + tolerance and \
-                    winInfo_active['y'] <= max(winInfo['y'], 0) + tolerance and \
-                    winInfo_active['y2'] >= min(winInfo['y2'], workAreaHeight) - tolerance:
-                geometry = get_window_geometry(window_active)
-                if geometry is None:  # window vanished
-                    return
-                newWidth = geometry.x - winInfo['x']
-                if newWidth >= tilingInfo['minSize']:
-                    # resize, according to the new geometry of the active window
-                    set_window_size(winID, width=newWidth)
-                    disp.sync()
-                    # update_windows_info()
+        best_winID = None
+        best_score = (1E99, 1E99)
 
-        elif moved_border == 2:  # upper border
-            # check, whether the windows were docked,
-            # before the geometry of the active window  got changed
-            if abs(winInfo['y2'] + 1 - winInfo_active['y']) <= tilingInfo['margin'] + tolerance and \
-                    winInfo_active['x'] <= max(winInfo['x'], 0) + tolerance and \
-                    winInfo_active['x2'] >= min(winInfo['x2'], workAreaWidth) - tolerance:
-                geometry = get_window_geometry(window_active)
-                if geometry is None:  # window vanished
-                    return
-                newHeight = geometry.y - winInfo['y']
-                if newHeight >= tilingInfo['minSize']:
-                    # resize, according to the new geometry of the active window
-                    set_window_size(winID, height=newHeight)
-                    disp.sync()
-                    # update_windows_info()
+        for winID, winInfo in windowsInfo.items():
+            if winID == windowID_active or winInfo['desktop'] != desktop:
+                continue
 
-        elif moved_border == 4:  # right border
-            if abs(winInfo_active['x2'] + 1 - winInfo['x']) <= tilingInfo['margin'] + tolerance and \
-                    winInfo_active['y'] <= max(winInfo['y'], 0) + tolerance and \
-                    winInfo_active['y2'] >= min(winInfo['y2'], workAreaHeight) - tolerance:
-                winActiveGeom = get_window_geometry(window_active)
-                if winActiveGeom is None:  # window vanished
-                    return
-                winActive_x2 = winActiveGeom.x + winActiveGeom.width - 1
-                newWidth = winInfo['x2'] - winActive_x2
-                if newWidth >= tilingInfo['minSize']:
-                    set_window_position(winID, x=winActive_x2 + 1)
-                    set_window_size(winID, width=newWidth)
-                    disp.sync()
-                    # update_windows_info()
+            overlap_y = max(winInfo['y'], winInfo_active['y']) <= min(winInfo['y2'], winInfo_active['y2'])
+            overlap_x = max(winInfo['x'], winInfo_active['x']) <= min(winInfo['x2'], winInfo_active['x2'])
 
-        elif moved_border == 8:  # lower border
-            if abs(winInfo_active['y2'] + 1 - winInfo['y']) <= tilingInfo['margin'] + tolerance and \
-                    winInfo_active['x'] <= max(winInfo['x'], 0) + tolerance and \
-                    winInfo_active['x2'] >= min(winInfo['x2'], workAreaWidth) - tolerance:
-                winActiveGeom = get_window_geometry(window_active)
-                if winActiveGeom is None:  # window vanished
-                    return
-                winActive_y2 = winActiveGeom.y + winActiveGeom.height - 1
-                newHeight = winInfo['y2'] - winActive_y2
-                if newHeight >= tilingInfo['minSize']:
-                    set_window_position(winID, y=winActive_y2 + 1)
-                    set_window_size(winID, height=newHeight)
-                    disp.sync()
-                    # update_windows_info()
+            if border == 1 and overlap_y:  # left border
+                if winInfo['x'] < winInfo_active['x'] + winInfo_active['width'] / 2:
+                    dist = max(0, winInfo_active['x'] - winInfo['x2'])
+                    center_dist = abs((winInfo['x'] + winInfo['x2']) / 2 - winInfo_active['x'])
+                    score = (dist, center_dist)
+                    if score < best_score:
+                        best_score = score
+                        best_winID = winID
+            elif border == 2 and overlap_x:  # upper border
+                if winInfo['y'] < winInfo_active['y'] + winInfo_active['height'] / 2:
+                    dist = max(0, winInfo_active['y'] - winInfo['y2'])
+                    center_dist = abs((winInfo['y'] + winInfo['y2']) / 2 - winInfo_active['y'])
+                    score = (dist, center_dist)
+                    if score < best_score:
+                        best_score = score
+                        best_winID = winID
+            elif border == 4 and overlap_y:  # right border
+                if winInfo['x2'] > winInfo_active['x'] + winInfo_active['width'] / 2:
+                    dist = max(0, winInfo['x'] - winInfo_active['x2'])
+                    center_dist = abs((winInfo['x'] + winInfo['x2']) / 2 - winInfo_active['x2'])
+                    score = (dist, center_dist)
+                    if score < best_score:
+                        best_score = score
+                        best_winID = winID
+            elif border == 8 and overlap_x:  # lower border
+                if winInfo['y2'] > winInfo_active['y'] + winInfo_active['height'] / 2:
+                    dist = max(0, winInfo['y'] - winInfo_active['y2'])
+                    center_dist = abs((winInfo['y'] + winInfo['y2']) / 2 - winInfo_active['y2'])
+                    score = (dist, center_dist)
+                    if score < best_score:
+                        best_score = score
+                        best_winID = winID
+
+        if best_winID is None or best_score[0] > tilingInfo['margin']:
+            continue
+
+        targetInfo = windowsInfo[best_winID]
+
+        if border == 1:
+            newWidth = active_geometry.x - targetInfo['x']
+            if newWidth >= tilingInfo['minSize']:
+                set_window_size(best_winID, width=newWidth)
+                targetInfo['width'] = newWidth
+                targetInfo['x2'] = targetInfo['x'] + newWidth - 1
+        elif border == 2:
+            newHeight = active_geometry.y - targetInfo['y']
+            if newHeight >= tilingInfo['minSize']:
+                set_window_size(best_winID, height=newHeight)
+                targetInfo['height'] = newHeight
+                targetInfo['y2'] = targetInfo['y'] + newHeight - 1
+        elif border == 4:
+            winActive_x2 = active_geometry.x + active_geometry.width - 1
+            newWidth = targetInfo['x2'] - winActive_x2
+            if newWidth >= tilingInfo['minSize']:
+                set_window_position(best_winID, x=winActive_x2 + 1)
+                set_window_size(best_winID, width=newWidth)
+                targetInfo['x'] = winActive_x2 + 1
+                targetInfo['width'] = newWidth
+        elif border == 8:
+            winActive_y2 = active_geometry.y + active_geometry.height - 1
+            newHeight = targetInfo['y2'] - winActive_y2
+            if newHeight >= tilingInfo['minSize']:
+                set_window_position(best_winID, y=winActive_y2 + 1)
+                set_window_size(best_winID, height=newHeight)
+                targetInfo['y'] = winActive_y2 + 1
+                targetInfo['height'] = newHeight
+
+    # Update active window cache immediately
+    winInfo_active['x'] = active_geometry.x
+    winInfo_active['y'] = active_geometry.y
+    winInfo_active['width'] = active_geometry.width
+    winInfo_active['height'] = active_geometry.height
+    winInfo_active['x2'] = active_geometry.x + active_geometry.width - 1
+    winInfo_active['y2'] = active_geometry.y + active_geometry.height - 1
+
+    disp.sync()
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1757,17 +1788,31 @@ def unmaximize_window(window):
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
-def update_windows_info(windowID_active=None):
+def update_windows_info(windowID_active=None, only_geometries=False, update_geometries=True):
     """
     Update the dictionary containing all windows, parent-windows, names, desktop-number and geometry.
     Windows with names / titles that match the ignore-list and modal and sticky windows are not taken into account.
 
-    :param window_active:     active window
+    :param windowID_active:   ID of active window
+    :param only_geometries:   if True, only update geometries of existing windows (much faster)
+    :param update_geometries: if True, also update geometries during discovery
     :return: status           whether the number of windows has changed,  and
              desktopList      list of desktops, when a window got moved from one desktop to another
     """
     global NET_CLIENT_LIST, NET_WM_DESKTOP, NET_WM_STATE_MODAL, NET_WM_STATE_STICKY, ANY_PROPERTYTYPE, Xroot, disp
     global tilingInfo, windowsInfo, verbosityLevel
+
+    if only_geometries:
+        for winID, winInfo in windowsInfo.items():
+            geometry = get_window_geometry(winInfo['win'], winID)
+            if geometry is not None:
+                winInfo['x'] = geometry.x
+                winInfo['y'] = geometry.y
+                winInfo['height'] = geometry.height
+                winInfo['width'] = geometry.width
+                winInfo['x2'] = geometry.x + geometry.width - 1
+                winInfo['y2'] = geometry.y + geometry.height - 1
+        return False, set()
 
     windowIDs = Xroot.get_full_property(NET_CLIENT_LIST, ANY_PROPERTYTYPE).value
     numWindowsChanged = False
@@ -1783,10 +1828,31 @@ def update_windows_info(windowID_active=None):
     # update the geometry of existing windows and add new windows
     for winID in windowIDs:
         try:
-            try:
-                win = windowsInfo[winID]['win']
-            except KeyError:
-                win = disp.create_resource_object('window', winID)
+            if winID in windowsInfo:
+                if update_geometries:
+                    win = windowsInfo[winID]['win']
+                    desktop = win.get_full_property(NET_WM_DESKTOP, ANY_PROPERTYTYPE).value[0]
+                    geometry = get_window_geometry(win, winID)
+                    if geometry is None:  # window vanished
+                        continue
+                    try:
+                        if windowsInfo[winID]['desktop'] != desktop:
+                            numWindowsChanged = True  # Window was moved to another desktop
+                            desktopList.append(desktop)  # Tiling (if activated) needs to be done
+                            desktopList.append(windowsInfo[winID]['desktop'])  # on both desktops
+                    except KeyError:
+                        pass
+                    windowsInfo[winID]['desktop'] = desktop
+                    windowsInfo[winID]['x'] = geometry.x
+                    windowsInfo[winID]['y'] = geometry.y
+                    windowsInfo[winID]['height'] = geometry.height
+                    windowsInfo[winID]['width'] = geometry.width
+                    windowsInfo[winID]['x2'] = geometry.x + geometry.width - 1
+                    windowsInfo[winID]['y2'] = geometry.y + geometry.height - 1
+                continue
+
+            # New window
+            win = disp.create_resource_object('window', winID)
 
             if NET_WM_STATE_MODAL in win.get_full_property(NET_WM_STATE, 0).value.tolist():
                 if verbosityLevel > 1:
@@ -1812,28 +1878,22 @@ def update_windows_info(windowID_active=None):
             else:
                 is_ignored = match_ignore(tilingInfo['ignoreWindows'], name, title)
 
-            if winID in windowsInfo or not is_ignored:
+            if not is_ignored:
                 desktop = win.get_full_property(NET_WM_DESKTOP, ANY_PROPERTYTYPE).value[0]
-                geometry = get_window_geometry(win)
+                geometry = get_window_geometry(win, winID)
                 if geometry is None:  # window vanished
                     continue
-                if winID not in windowsInfo:
-                    windowsInfo[winID] = dict()
-                    windowsInfo[winID]['name'] = name
-                    windowsInfo[winID]['win'] = win
-                    windowsInfo[winID]['winParent'] = get_parent_window(win)
-                    windowsInfo[winID]['winSetXY'] = None
-                    windowsInfo[winID]['groups'] = [0]
-                    numWindowsChanged = True
-                    if match(tilingInfo['delayTilingWindowsWithNames'], name):
-                        doDelay = True  # An app, that needs some delay, got launched
-                try:
-                    if windowsInfo[winID]['desktop'] != desktop:
-                        numWindowsChanged = True  # Window was moved to another desktop
-                        desktopList.append(desktop)  # Tiling (if activated) needs to be done
-                        desktopList.append(windowsInfo[winID]['desktop'])  # on both desktops
-                except KeyError:
-                    pass
+
+                windowsInfo[winID] = dict()
+                windowsInfo[winID]['name'] = name
+                windowsInfo[winID]['win'] = win
+                windowsInfo[winID]['winParent'] = get_parent_window(win)
+                windowsInfo[winID]['winSetXY'] = None
+                windowsInfo[winID]['groups'] = [0]
+                numWindowsChanged = True
+                if match(tilingInfo['delayTilingWindowsWithNames'], name):
+                    doDelay = True  # An app, that needs some delay, got launched
+
                 windowsInfo[winID]['desktop'] = desktop
                 windowsInfo[winID]['x'] = geometry.x
                 windowsInfo[winID]['y'] = geometry.y
@@ -1903,7 +1963,7 @@ def run(window_active, window_active_parent, windowID_active):
             windowID_active = Xroot.get_full_property(NET_ACTIVE_WINDOW, ANY_PROPERTYTYPE).value[0]
             window_active = disp.create_resource_object('window', windowID_active)
             window_active_parent = get_parent_window(window_active)
-            numWindowsChanged, desktopList = update_windows_info(windowID_active)
+            numWindowsChanged, desktopList = update_windows_info(windowID_active, update_geometries=False)
 
             if verbosityLevel > 0:
                 if event.atom == NET_ACTIVE_WINDOW:
@@ -1933,28 +1993,58 @@ def run(window_active, window_active_parent, windowID_active):
         elif event.type == PROPERTY_NOTIFY:
             # The number of windows has changed but not the active window (?)
             # This happens when XFCE is configured to not automatically focus new windows.
-            numWindowsChanged, _ = update_windows_info(windowID_active)
+            numWindowsChanged, _ = update_windows_info(windowID_active, update_geometries=False)
             if numWindowsChanged:
                 if verbosityLevel > 0:
                     print('num. windows changed')
                 tile_windows(window_active)
 
         elif event.type == CONFIGURE_NOTIFY and event.window == window_active_parent:
-            moved_border = get_moved_border(windowID_active, window_active)
+            # Optimization: Use event data directly to avoid X11 roundtrips (get_geometry)
+            # which is the primary cause of 'losing track' during fast moves.
+            try:
+                winInfo = windowsInfo[windowID_active]
+            except KeyError:
+                update_windows_info()
+                continue
+
+            # Detect moved borders by comparing event data to our internal cache
+            moved_border = 0
+            if winInfo['x'] != event.x:
+                moved_border |= 1  # left
+            if winInfo['y'] != event.y:
+                moved_border |= 2  # upper
+            if winInfo['x2'] != event.x + event.width - 1:
+                moved_border |= 4  # right
+            if winInfo['y2'] != event.y + event.height - 1:
+                moved_border |= 8  # lower
+
             if moved_border:
-                resize_docked_windows(windowID_active, window_active, moved_border)
+                # Create a geometry snapshot from the event to pass to the solver
+                class EventGeometry:
+                    def __init__(self, x, y, w, h):
+                        self.x, self.y, self.width, self.height = x, y, w, h
+
+                geometry = EventGeometry(event.x, event.y, event.width, event.height)
+                resize_docked_windows(windowID_active, window_active, moved_border, geometry)
+
+                # CACHE UPDATE: Instead of update_windows_info(),
+                # we update the cache ourselves to keep it 'real-time' and fast.
+                winInfo['x'] = event.x
+                winInfo['y'] = event.y
+                winInfo['width'] = event.width
+                winInfo['height'] = event.height
+                winInfo['x2'] = event.x + event.width - 1
+                winInfo['y2'] = event.y + event.height - 1
             else:
-                # A window was moved. Check whether its new position should trigger re-tiling.
-                geometry = get_window_geometry(window_active)
-                if geometry is None:  # window vanished
-                    continue
+                # Window moved without resizing or same-size redundant event
+                # Check for large jumps that might trigger re-tiling (e.g. snapping to edges)
                 workAreaWidth, workAreaHeight = Xroot.get_full_property(NET_WORKAREA, 0).value.tolist()[2:4]
-                if geometry.x <= -20 or geometry.y <= -20 \
-                        or geometry.x + geometry.width > workAreaWidth + 20 \
-                        or geometry.y + geometry.height > workAreaHeight + 20:
+                if event.x <= -20 or event.y <= -20 \
+                        or event.x + event.width > workAreaWidth + 20 \
+                        or event.y + event.height > workAreaHeight + 20:
                     tile_windows(window_active)
-                    time.sleep(0.1)
-            update_windows_info()
+                    update_windows_info()
 
         elif event.type == KEY_RELEASE:
             windowID_active, window_active = handle_key_event(event.detail, windowID_active, window_active)
