@@ -425,19 +425,21 @@ def hightlight_mouse_cursor():
 # ----------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------------------------------
-def init(configFile='~/.config/xpytilerc'):
+def init(configFile='~/.config/xpytilerc', extra_args=None):
     """
     Initialization
     configFile:  file-path of the config-file
+    extra_args:  list of command strings to spawn and track
     :return:     window_active, window_active_parent, windowID_active
     """
-    global disp, Xroot, screen
+    global disp, Xroot, screen, tilingInfo
     global windowsInfo
     global NET_ACTIVE_WINDOW, NET_WM_DESKTOP, NET_CLIENT_LIST, NET_CURRENT_DESKTOP
     global NET_WM_STATE_FULLSCREEN, NET_WM_STATE_MAXIMIZED_VERT, NET_WM_STATE_MAXIMIZED_HORZ
     global NET_WM_STATE, NET_WM_STATE_HIDDEN, NET_WORKAREA, NET_WM_NAME, NET_WM_STATE_MODAL
     global NET_WM_STATE_STICKY, MOTIF_WM_HINTS, ANY_PROPERTYTYPE, GTK_FRAME_EXTENTS
     global XPYTILE_REMOTE
+    global NET_WM_PID
 
     disp = Xlib.display.Display()
     screen = disp.screen()
@@ -460,12 +462,30 @@ def init(configFile='~/.config/xpytilerc'):
     GTK_FRAME_EXTENTS = disp.get_atom('_GTK_FRAME_EXTENTS')
     ANY_PROPERTYTYPE = Xlib.X.AnyPropertyType
     XPYTILE_REMOTE = disp.get_atom('_XPYTILE_REMOTE')
+    NET_WM_PID = disp.intern_atom('_NET_WM_PID')
 
     config = configparser.ConfigParser()
     config.read(os.path.expanduser(configFile))
     init_tiling_info(config)
     init_hotkeys_info(config)
     init_notification_info(config)
+
+    # If command line arguments are provided, spawn them and track their PIDs
+    if extra_args:
+        for cmd in extra_args:
+            try:
+                # Spawn the process
+                proc = subprocess.Popen(cmd.split())
+                tilingInfo['pids'].append(proc.pid)
+                # Also track existing PIDs for this command name (handles daemons/singletons)
+                cmd_name = cmd.split()[0].split('/')[-1]
+                try:
+                    pids = subprocess.check_output(['pgrep', '-f', cmd_name]).decode().split()
+                    tilingInfo['pids'].extend([int(p) for p in pids])
+                except:
+                    pass
+            except Exception as e:
+                print(f"Error spawning process '{cmd}': {e}")
 
     # determine active window and its parent
     window_active = disp.get_input_focus().focus
@@ -573,11 +593,13 @@ def init_tiling_info(config):
 
     # ----------------------------------------------------------------------------
 
+    global tilingInfo
     tilingInfo = dict()
 
     # configured settings that define ...
     #   ... what windows should be ignored depending on their name and title.
 
+    tilingInfo['pids'] = list()
     tilingInfo['allowWindows'] = list()
     for line in config['General'].get('allowWindows', '').split('\n'):
         entry = parseConfigIgnoreWindowEntry(line)
@@ -880,123 +902,60 @@ def recreate_window_geometries():
 
 # ----------------------------------------------------------------------------------------------------------------------
 def resize_docked_windows(windowID_active, window_active, moved_border, active_geometry):
-    """
-    Resize the side-by-side docked windwows using a spatial topology solver, mimicking true TWMs.
-
-    :param windowID_active:   ID of the active window
-    :param window_active:     active window
-    :param moved_border:      points out which border of the active window got moved
-    :param active_geometry:   geometry snapshot of the active window
-    :return:
-    """
-    global disp, tilingInfo, NET_WORKAREA
-    global windowsInfo  # dict with windows and their geometries
-
-    if not moved_border or active_geometry is None:
-        return None
-
+    global disp, tilingInfo, windowsInfo
+    if not moved_border or not active_geometry: return
     winInfo_active = windowsInfo.get(windowID_active)
-    if not winInfo_active:
-        return None
-
-    # check whether resizing is active for the desktop of the resized window
+    if not winInfo_active: return
     desktop = winInfo_active['desktop']
-    if not tilingInfo['resizeWindows'][desktop]:
-        return
+    if not tilingInfo['resizeWindows'][desktop]: return
 
-    # Check for pure translation (moved all borders without changing size)
-    if active_geometry.width == winInfo_active['width'] and active_geometry.height == winInfo_active['height']:
-        return
+    # Spatial solver: find neighbors by checking topological adjacency
+    # We use a 20px overlap tolerance to handle fast moves and async drifts
+    for winID, winInfo in windowsInfo.items():
+        if winID == windowID_active or winInfo['desktop'] != desktop: continue
 
-    for border in [1, 2, 4, 8]:
-        if not (moved_border & border):
-            continue
+        # Calculate overlap in both axes
+        overlap_x = max(winInfo['x'], active_geometry.x) < min(winInfo['x2'], active_geometry.x + active_geometry.width)
+        overlap_y = max(winInfo['y'], active_geometry.y) < min(winInfo['y2'], active_geometry.y + active_geometry.height)
 
-        best_winID = None
-        best_score = (1E99, 1E99)
+        # Check if windows are "touching" or nearly touching on the relevant side
+        if (moved_border & 1) and overlap_y: # Left
+            if abs(winInfo['x2'] - winInfo_active['x']) < 20:
+                new_w = active_geometry.x - winInfo['x']
+                if new_w >= tilingInfo['minSize']:
+                    set_window_size(winID, width=new_w)
+                    winInfo['width'], winInfo['x2'] = new_w, winInfo['x'] + new_w - 1
 
-        for winID, winInfo in windowsInfo.items():
-            if winID == windowID_active or winInfo['desktop'] != desktop:
-                continue
+        if (moved_border & 2) and overlap_x: # Top
+            if abs(winInfo['y2'] - winInfo_active['y']) < 20:
+                new_h = active_geometry.y - winInfo['y']
+                if new_h >= tilingInfo['minSize']:
+                    set_window_size(winID, height=new_h)
+                    winInfo['height'], winInfo['y2'] = new_h, winInfo['y'] + new_h - 1
 
-            overlap_y = max(winInfo['y'], winInfo_active['y']) <= min(winInfo['y2'], winInfo_active['y2'])
-            overlap_x = max(winInfo['x'], winInfo_active['x']) <= min(winInfo['x2'], winInfo_active['x2'])
+        if (moved_border & 4) and overlap_y: # Right
+            if abs(winInfo['x'] - (winInfo_active['x'] + winInfo_active['width'])) < 20:
+                new_x = active_geometry.x + active_geometry.width
+                new_w = winInfo['x2'] - new_x + 1
+                if new_w >= tilingInfo['minSize']:
+                    set_window_position(winID, x=new_x)
+                    set_window_size(winID, width=new_w)
+                    winInfo['x'], winInfo['width'] = new_x, new_w
 
-            if border == 1 and overlap_y:  # left border
-                if winInfo['x'] < winInfo_active['x'] + winInfo_active['width'] / 2:
-                    dist = max(0, winInfo_active['x'] - winInfo['x2'])
-                    center_dist = abs((winInfo['x'] + winInfo['x2']) / 2 - winInfo_active['x'])
-                    score = (dist, center_dist)
-                    if score < best_score:
-                        best_score = score
-                        best_winID = winID
-            elif border == 2 and overlap_x:  # upper border
-                if winInfo['y'] < winInfo_active['y'] + winInfo_active['height'] / 2:
-                    dist = max(0, winInfo_active['y'] - winInfo['y2'])
-                    center_dist = abs((winInfo['y'] + winInfo['y2']) / 2 - winInfo_active['y'])
-                    score = (dist, center_dist)
-                    if score < best_score:
-                        best_score = score
-                        best_winID = winID
-            elif border == 4 and overlap_y:  # right border
-                if winInfo['x2'] > winInfo_active['x'] + winInfo_active['width'] / 2:
-                    dist = max(0, winInfo['x'] - winInfo_active['x2'])
-                    center_dist = abs((winInfo['x'] + winInfo['x2']) / 2 - winInfo_active['x2'])
-                    score = (dist, center_dist)
-                    if score < best_score:
-                        best_score = score
-                        best_winID = winID
-            elif border == 8 and overlap_x:  # lower border
-                if winInfo['y2'] > winInfo_active['y'] + winInfo_active['height'] / 2:
-                    dist = max(0, winInfo['y'] - winInfo_active['y2'])
-                    center_dist = abs((winInfo['y'] + winInfo['y2']) / 2 - winInfo_active['y2'])
-                    score = (dist, center_dist)
-                    if score < best_score:
-                        best_score = score
-                        best_winID = winID
+        if (moved_border & 8) and overlap_x: # Bottom
+            if abs(winInfo['y'] - (winInfo_active['y'] + winInfo_active['height'])) < 20:
+                new_y = active_geometry.y + active_geometry.height
+                new_h = winInfo['y2'] - new_y + 1
+                if new_h >= tilingInfo['minSize']:
+                    set_window_position(winID, y=new_y)
+                    set_window_size(winID, height=new_h)
+                    winInfo['y'], winInfo['height'] = new_y, new_h
 
-        if best_winID is None or best_score[0] > tilingInfo['margin']:
-            continue
-
-        targetInfo = windowsInfo[best_winID]
-
-        if border == 1:
-            newWidth = active_geometry.x - targetInfo['x']
-            if newWidth >= tilingInfo['minSize']:
-                set_window_size(best_winID, width=newWidth)
-                targetInfo['width'] = newWidth
-                targetInfo['x2'] = targetInfo['x'] + newWidth - 1
-        elif border == 2:
-            newHeight = active_geometry.y - targetInfo['y']
-            if newHeight >= tilingInfo['minSize']:
-                set_window_size(best_winID, height=newHeight)
-                targetInfo['height'] = newHeight
-                targetInfo['y2'] = targetInfo['y'] + newHeight - 1
-        elif border == 4:
-            winActive_x2 = active_geometry.x + active_geometry.width - 1
-            newWidth = targetInfo['x2'] - winActive_x2
-            if newWidth >= tilingInfo['minSize']:
-                set_window_position(best_winID, x=winActive_x2 + 1)
-                set_window_size(best_winID, width=newWidth)
-                targetInfo['x'] = winActive_x2 + 1
-                targetInfo['width'] = newWidth
-        elif border == 8:
-            winActive_y2 = active_geometry.y + active_geometry.height - 1
-            newHeight = targetInfo['y2'] - winActive_y2
-            if newHeight >= tilingInfo['minSize']:
-                set_window_position(best_winID, y=winActive_y2 + 1)
-                set_window_size(best_winID, height=newHeight)
-                targetInfo['y'] = winActive_y2 + 1
-                targetInfo['height'] = newHeight
-
-    # Update active window cache immediately
-    winInfo_active['x'] = active_geometry.x
-    winInfo_active['y'] = active_geometry.y
-    winInfo_active['width'] = active_geometry.width
-    winInfo_active['height'] = active_geometry.height
-    winInfo_active['x2'] = active_geometry.x + active_geometry.width - 1
-    winInfo_active['y2'] = active_geometry.y + active_geometry.height - 1
-
+    # Atomic cache sync
+    for k in ['x', 'y', 'width', 'height']:
+        winInfo_active[k] = getattr(active_geometry, k)
+    winInfo_active['x2'] = winInfo_active['x'] + winInfo_active['width'] - 1
+    winInfo_active['y2'] = winInfo_active['y'] + winInfo_active['height'] - 1
     disp.sync()
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -1873,34 +1832,58 @@ def update_windows_info(windowID_active=None, only_geometries=False, update_geom
             name = win.get_wm_class()[1]
             title = get_windows_title(win)
 
-            if tilingInfo['allowWindows']:
-                is_ignored = not match_window_to_config(tilingInfo['allowWindows'], name, title, 'Allowing')
-            else:
-                is_ignored = match_ignore(tilingInfo['ignoreWindows'], name, title)
+            # PID-based filtering: if pids list is not empty, only track those
+            if tilingInfo['pids']:
+                try:
+                    pid_prop = win.get_full_property(NET_WM_PID, 0)
+                    win_pid = pid_prop.value[0] if pid_prop else None
 
-            if not is_ignored:
-                desktop = win.get_full_property(NET_WM_DESKTOP, ANY_PROPERTYTYPE).value[0]
-                geometry = get_window_geometry(win, winID)
-                if geometry is None:  # window vanished
+                    matched = False
+                    curr = win_pid
+                    # Check up to 10 levels of parents for performance and safety
+                    for _ in range(10):
+                        if not curr or curr <= 1: break
+                        if curr in tilingInfo['pids']:
+                            matched = True
+                            break
+                        try:
+                            with open(f"/proc/{curr}/status", "r") as f:
+                                for line in f:
+                                    if line.startswith("PPid:"):
+                                        curr = int(line.split()[1])
+                                        break
+                                else: break
+                        except: break
+                    if not matched: continue
+                except: continue
+            elif tilingInfo['allowWindows']:
+                if not match_window_to_config(tilingInfo['allowWindows'], name, title, 'Allowing'):
                     continue
+            elif match_ignore(tilingInfo['ignoreWindows'], name, title):
+                continue
 
-                windowsInfo[winID] = dict()
-                windowsInfo[winID]['name'] = name
-                windowsInfo[winID]['win'] = win
-                windowsInfo[winID]['winParent'] = get_parent_window(win)
-                windowsInfo[winID]['winSetXY'] = None
-                windowsInfo[winID]['groups'] = [0]
-                numWindowsChanged = True
-                if match(tilingInfo['delayTilingWindowsWithNames'], name):
-                    doDelay = True  # An app, that needs some delay, got launched
+            desktop = win.get_full_property(NET_WM_DESKTOP, ANY_PROPERTYTYPE).value[0]
+            geometry = get_window_geometry(win, winID)
+            if geometry is None:  # window vanished
+                continue
 
-                windowsInfo[winID]['desktop'] = desktop
-                windowsInfo[winID]['x'] = geometry.x
-                windowsInfo[winID]['y'] = geometry.y
-                windowsInfo[winID]['height'] = geometry.height
-                windowsInfo[winID]['width'] = geometry.width
-                windowsInfo[winID]['x2'] = geometry.x + geometry.width - 1
-                windowsInfo[winID]['y2'] = geometry.y + geometry.height - 1
+            windowsInfo[winID] = dict()
+            windowsInfo[winID]['name'] = name
+            windowsInfo[winID]['win'] = win
+            windowsInfo[winID]['winParent'] = get_parent_window(win)
+            windowsInfo[winID]['winSetXY'] = None
+            windowsInfo[winID]['groups'] = [0]
+            numWindowsChanged = True
+            if match(tilingInfo['delayTilingWindowsWithNames'], name):
+                doDelay = True  # An app, that needs some delay, got launched
+
+            windowsInfo[winID]['desktop'] = desktop
+            windowsInfo[winID]['x'] = geometry.x
+            windowsInfo[winID]['y'] = geometry.y
+            windowsInfo[winID]['height'] = geometry.height
+            windowsInfo[winID]['width'] = geometry.width
+            windowsInfo[winID]['x2'] = geometry.x + geometry.width - 1
+            windowsInfo[winID]['y2'] = geometry.y + geometry.height - 1
         except:
             pass  # window has vanished
 
@@ -2075,6 +2058,7 @@ def main():
     parser.add_argument('-v', '--verbose', action="store_true", help='Print name and title of new windows')
     parser.add_argument('-vv', '--verbose2', action="store_true",
                         help='also print details about checking name and title whether to ignore the new window')
+    parser.add_argument('extra_args', nargs='*', help='Command to spawn and track')
     args = parser.parse_args()
     if args.verbose2:
         verbosityLevel = 2
@@ -2099,7 +2083,7 @@ def main():
     # --- Do the actual work ---
     try:
         # Initialize
-        window_active, window_active_parent, windowID_active = init(configFilePath)
+        window_active, window_active_parent, windowID_active = init(configFilePath, args.extra_args)
         # Run: wait for events and handle them
         run(window_active, window_active_parent, windowID_active)
     except KeyboardInterrupt:
